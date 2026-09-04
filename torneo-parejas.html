@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Torneo de Parejas</title>
+
+<!-- Firebase (base de datos gratuita en tiempo real) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+
+<!-- React sin build step -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+</head>
+<body>
+<div id="error-banner" style="display:none; background:#fee; color:#900; padding:12px; font-family:monospace; font-size:12px; white-space:pre-wrap; border-bottom:2px solid #900;"></div>
+<div id="root">Cargando…</div>
+
+<script>
+  function mostrarError(msg) {
+    var b = document.getElementById("error-banner");
+    b.style.display = "block";
+    b.textContent += msg + "\n";
+  }
+  window.addEventListener("error", function (e) {
+    mostrarError("Error: " + e.message + " (" + (e.filename || "") + ":" + (e.lineno || "") + ")");
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    var reason = e.reason && e.reason.message ? e.reason.message : e.reason;
+    mostrarError("Promesa rechazada: " + reason);
+  });
+</script>
+
+
+<script>
+const {
+  useState,
+  useEffect,
+  useMemo,
+  useCallback
+} = React;
+
+/* =========================================================
+   1) CONFIGURACIÓN DE FIREBASE
+   Sustituye estos valores por los de TU proyecto de Firebase:
+   Firebase console -> Configuración del proyecto -> Tus apps -> Web (</>)
+   ========================================================= */
+const firebaseConfig = {
+  apiKey: "AIzaSyAs_VWKB5Q16uTUJeZGnkJY-VXnPQtsTd4",
+  authDomain: "torneosdero.firebaseapp.com",
+  databaseURL: "https://torneosdero-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "torneosdero",
+  storageBucket: "torneosdero.firebasestorage.app",
+  messagingSenderId: "614062530013",
+  appId: "1:614062530013:web:59f5c0e874a16f8bf92a34"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+
+/* ---------- utilidades ---------- */
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+function generateRoundRobin(pairIds) {
+  // método del círculo: 6 parejas -> 5 jornadas x 3 partidos
+  const n = pairIds.length;
+  const fixed = pairIds[0];
+  let rotating = pairIds.slice(1);
+  const rounds = [];
+  for (let r = 0; r < n - 1; r++) {
+    const current = [fixed, ...rotating];
+    const matches = [];
+    for (let i = 0; i < n / 2; i++) {
+      matches.push({
+        id: uid(),
+        pairA: current[i],
+        pairB: current[n - 1 - i],
+        scoreText: "",
+        winner: null
+      });
+    }
+    rounds.push({
+      round: r + 1,
+      matches
+    });
+    rotating.unshift(rotating.pop());
+  }
+  return rounds;
+}
+function computeStandings(pairs, rounds) {
+  const table = {};
+  pairs.forEach(p => {
+    table[p.id] = {
+      id: p.id,
+      name: p.name,
+      pj: 0,
+      pg: 0,
+      pp: 0,
+      pts: 0
+    };
+  });
+  rounds.forEach(r => r.matches.forEach(m => {
+    if (!m.winner) return;
+    const loser = m.winner === m.pairA ? m.pairB : m.pairA;
+    if (table[m.winner]) {
+      table[m.winner].pj += 1;
+      table[m.winner].pg += 1;
+      table[m.winner].pts += 2;
+    }
+    if (table[loser]) {
+      table[loser].pj += 1;
+      table[loser].pp += 1;
+    }
+  }));
+  return Object.values(table).sort((a, b) => b.pts - a.pts || b.pg - a.pg || a.name.localeCompare(b.name));
+}
+function allMatchesPlayed(rounds) {
+  return rounds.every(r => r.matches.every(m => m.winner));
+}
+
+/* ---------- capa de datos (Firebase Realtime Database) ---------- */
+/* Todo el grupo lee y escribe el mismo nodo "torneos", por eso los
+   cambios se ven en tiempo real en todos los dispositivos. */
+
+function useTournamentsIndex() {
+  const [index, setIndex] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [slow, setSlow] = useState(false);
+  const [dbError, setDbError] = useState(null);
+  useEffect(() => {
+    const timeout = setTimeout(() => setSlow(true), 6000);
+    const ref = db.ref("torneos");
+    const handler = ref.on("value", snap => {
+      clearTimeout(timeout);
+      const val = snap.val() || {};
+      const list = Object.values(val).map(t => ({
+        id: t.id,
+        name: t.name,
+        date: t.date,
+        phase: t.phase
+      })).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+      setIndex(list);
+      setLoading(false);
+    }, err => {
+      clearTimeout(timeout);
+      setDbError(err && err.message || String(err));
+      setLoading(false);
+    });
+    return () => {
+      clearTimeout(timeout);
+      ref.off("value", handler);
+    };
+  }, []);
+  return {
+    index,
+    loading,
+    slow,
+    dbError
+  };
+}
+function useTournament(id) {
+  const [tournament, setTournament] = useState(null);
+  useEffect(() => {
+    if (!id) return;
+    const ref = db.ref("torneos/" + id);
+    const handler = ref.on("value", snap => setTournament(snap.val()));
+    return () => ref.off("value", handler);
+  }, [id]);
+  return tournament;
+}
+async function saveTournament(t) {
+  try {
+    await db.ref("torneos/" + t.id).set(t);
+    return true;
+  } catch (e) {
+    console.error(e);
+    return false;
+  }
+}
+async function deleteTournamentRemote(id) {
+  try {
+    await db.ref("torneos/" + id).remove();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+/* ---------- app ---------- */
+
+function App() {
+  const [screen, setScreen] = useState("home"); // home | crear | orden | liga | cuadro
+  const [currentId, setCurrentId] = useState(null);
+  const {
+    index,
+    loading,
+    slow,
+    dbError
+  } = useTournamentsIndex();
+  const liveTournament = useTournament(currentId);
+  const [localTournament, setLocalTournament] = useState(null);
+
+  // el torneo que se muestra: preferimos el que llega en tiempo real de Firebase,
+  // y usamos el local solo como respaldo inmediato tras crear uno nuevo.
+  const current = liveTournament || localTournament;
+  useEffect(() => {
+    if (liveTournament) setLocalTournament(null);
+  }, [liveTournament]);
+  const openTournament = id => {
+    setCurrentId(id);
+    const meta = index.find(x => x.id === id);
+    if (meta?.phase === "orden") setScreen("orden");else if (meta?.phase === "cuadro") setScreen("cuadro");else setScreen("liga");
+  };
+  const backHome = () => {
+    setCurrentId(null);
+    setLocalTournament(null);
+    setScreen("home");
+  };
+  const createTournament = async (name, date, pairNames) => {
+    const pairs = pairNames.map(n => ({
+      id: uid(),
+      name: n
+    }));
+    const t = {
+      id: uid(),
+      name,
+      date,
+      pairs,
+      order: pairs.map(p => p.id),
+      rounds: [],
+      phase: "orden",
+      bracket: null
+    };
+    setLocalTournament(t);
+    setCurrentId(t.id);
+    setScreen("orden");
+    await saveTournament(t);
+  };
+  const confirmOrderAndSchedule = async order => {
+    const rounds = generateRoundRobin(order);
+    const t = {
+      ...current,
+      order,
+      rounds,
+      phase: "liga"
+    };
+    setLocalTournament(t);
+    setScreen("liga");
+    await saveTournament(t);
+  };
+  const updateMatch = async (roundIdx, matchId, winner, scoreText) => {
+    const rounds = current.rounds.map((r, i) => i !== roundIdx ? r : {
+      ...r,
+      matches: r.matches.map(m => m.id === matchId ? {
+        ...m,
+        winner,
+        scoreText
+      } : m)
+    });
+    const t = {
+      ...current,
+      rounds
+    };
+    setLocalTournament(t);
+    await saveTournament(t);
+  };
+  const startBracket = async () => {
+    const standings = computeStandings(current.pairs, current.rounds);
+    const top4 = standings.slice(0, 4);
+    const bracket = {
+      semi1: {
+        id: uid(),
+        pairA: top4[0].id,
+        pairB: top4[3].id,
+        scoreText: "",
+        winner: null
+      },
+      semi2: {
+        id: uid(),
+        pairA: top4[1].id,
+        pairB: top4[2].id,
+        scoreText: "",
+        winner: null
+      },
+      final: {
+        id: uid(),
+        pairA: null,
+        pairB: null,
+        scoreText: "",
+        winner: null
+      },
+      seeds: top4.map(s => s.id)
+    };
+    const t = {
+      ...current,
+      phase: "cuadro",
+      bracket
+    };
+    setLocalTournament(t);
+    setScreen("cuadro");
+    await saveTournament(t);
+  };
+  const updateBracketMatch = async (key, winner, scoreText) => {
+    const bracket = {
+      ...current.bracket,
+      [key]: {
+        ...current.bracket[key],
+        winner,
+        scoreText
+      }
+    };
+    if (key === "semi1" || key === "semi2") {
+      const s1 = bracket.semi1.winner;
+      const s2 = bracket.semi2.winner;
+      bracket.final = {
+        ...bracket.final,
+        pairA: s1 || null,
+        pairB: s2 || null
+      };
+    }
+    const t = {
+      ...current,
+      bracket
+    };
+    setLocalTournament(t);
+    await saveTournament(t);
+  };
+  const removeTournament = async (id, e) => {
+    e.stopPropagation();
+    if (!window.confirm("¿Eliminar este torneo? No se puede deshacer.")) return;
+    await deleteTournamentRemote(id);
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "app"
+  }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("header", {
+    className: "topbar"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "brand",
+    onClick: backHome
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "brand-mark"
+  }), "Torneo de Parejas"), current && /*#__PURE__*/React.createElement("div", {
+    className: "topbar-meta"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "t-name"
+  }, current.name), /*#__PURE__*/React.createElement("span", {
+    className: "t-date"
+  }, current.date))), /*#__PURE__*/React.createElement("main", {
+    className: "content"
+  }, loading ? /*#__PURE__*/React.createElement("div", {
+    className: "loading"
+  }, /*#__PURE__*/React.createElement("p", null, "Cargando…"), (slow || dbError) && /*#__PURE__*/React.createElement("div", {
+    className: "diag"
+  }, dbError ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("strong", null, "Firebase respondió con un error:"), /*#__PURE__*/React.createElement("p", null, dbError), /*#__PURE__*/React.createElement("p", null, "Revisa que en la Realtime Database, pestaña \"Reglas\", tengas publicado", " ", /*#__PURE__*/React.createElement("code", null, "{ \"rules\": { \".read\": true, \".write\": true } }"), " (con el botón \"Publicar\", no basta con escribirlo).")) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("strong", null, "Esto está tardando más de lo normal."), /*#__PURE__*/React.createElement("p", null, "Comprueba:"), /*#__PURE__*/React.createElement("ul", null, /*#__PURE__*/React.createElement("li", null, "Que has creado la ", /*#__PURE__*/React.createElement("strong", null, "Realtime Database"), " en Firebase (no Firestore)."), /*#__PURE__*/React.createElement("li", null, "Que la ", /*#__PURE__*/React.createElement("strong", null, "databaseURL"), " del firebaseConfig es correcta."), /*#__PURE__*/React.createElement("li", null, "Que estás en Chrome/Safari, no en el navegador integrado de WhatsApp."))))) : screen === "home" ? /*#__PURE__*/React.createElement(Home, {
+    index: index,
+    onOpen: openTournament,
+    onNew: () => setScreen("crear"),
+    onDelete: removeTournament
+  }) : screen === "crear" ? /*#__PURE__*/React.createElement(CrearTorneo, {
+    onCancel: backHome,
+    onCreate: createTournament
+  }) : screen === "orden" && current ? /*#__PURE__*/React.createElement(OrdenEmparejamientos, {
+    tournament: current,
+    onBack: backHome,
+    onConfirm: confirmOrderAndSchedule
+  }) : screen === "liga" && current ? /*#__PURE__*/React.createElement(Liga, {
+    tournament: current,
+    onBack: backHome,
+    onUpdateMatch: updateMatch,
+    onStartBracket: startBracket
+  }) : screen === "cuadro" && current ? /*#__PURE__*/React.createElement(Cuadro, {
+    tournament: current,
+    onBack: backHome,
+    onUpdateBracket: updateBracketMatch,
+    onBackToLiga: () => setScreen("liga")
+  }) : /*#__PURE__*/React.createElement("div", {
+    className: "loading"
+  }, "Cargando torneo…")));
+}
+
+/* ---------- pantallas ---------- */
+
+function Home({
+  index,
+  onOpen,
+  onNew,
+  onDelete
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    className: "screen"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "screen-head"
+  }, /*#__PURE__*/React.createElement("h1", null, "Tus torneos"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-primary",
+    onClick: onNew
+  }, "+ Nuevo torneo")), index.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    className: "empty"
+  }, /*#__PURE__*/React.createElement("p", null, "Todavía no hay ningún torneo."), /*#__PURE__*/React.createElement("p", {
+    className: "muted"
+  }, "Crea uno para empezar a sortear parejas y llevar la liga.")) : /*#__PURE__*/React.createElement("ul", {
+    className: "t-list"
+  }, index.map(t => /*#__PURE__*/React.createElement("li", {
+    key: t.id,
+    className: "t-row",
+    onClick: () => onOpen(t.id)
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "t-row-main"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "t-row-name"
+  }, t.name), /*#__PURE__*/React.createElement("span", {
+    className: "t-row-date"
+  }, t.date || "sin fecha")), /*#__PURE__*/React.createElement("span", {
+    className: "badge badge-" + t.phase
+  }, t.phase === "orden" ? "Por sortear" : t.phase === "liga" ? "Liga en curso" : "Fase final"), /*#__PURE__*/React.createElement("button", {
+    className: "icon-btn",
+    title: "Eliminar",
+    onClick: e => onDelete(t.id, e)
+  }, "✕")))));
+}
+function CrearTorneo({
+  onCancel,
+  onCreate
+}) {
+  const [name, setName] = useState("");
+  const [date, setDate] = useState("");
+  const [pairs, setPairs] = useState(["", "", "", "", "", ""]);
+  const canSubmit = name.trim() && pairs.every(p => p.trim());
+  const setPair = (i, v) => setPairs(prev => prev.map((p, idx) => idx === i ? v : p));
+  return /*#__PURE__*/React.createElement("div", {
+    className: "screen"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "screen-head"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "link-btn",
+    onClick: onCancel
+  }, "← Torneos")), /*#__PURE__*/React.createElement("h1", null, "Nuevo torneo"), /*#__PURE__*/React.createElement("div", {
+    className: "form-grid"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "field"
+  }, /*#__PURE__*/React.createElement("span", null, "Nombre del torneo"), /*#__PURE__*/React.createElement("input", {
+    value: name,
+    onChange: e => setName(e.target.value),
+    placeholder: "p. ej. Torneo de Verano"
+  })), /*#__PURE__*/React.createElement("label", {
+    className: "field"
+  }, /*#__PURE__*/React.createElement("span", null, "Fecha"), /*#__PURE__*/React.createElement("input", {
+    type: "date",
+    value: date,
+    onChange: e => setDate(e.target.value)
+  }))), /*#__PURE__*/React.createElement("h2", {
+    className: "subhead"
+  }, "Parejas (6)"), /*#__PURE__*/React.createElement("div", {
+    className: "pairs-grid"
+  }, pairs.map((p, i) => /*#__PURE__*/React.createElement("label", {
+    className: "field",
+    key: i
+  }, /*#__PURE__*/React.createElement("span", null, "Pareja ", i + 1), /*#__PURE__*/React.createElement("input", {
+    value: p,
+    onChange: e => setPair(i, e.target.value),
+    placeholder: `Nombres de la pareja ${i + 1}`
+  })))), /*#__PURE__*/React.createElement("div", {
+    className: "actions"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-primary",
+    disabled: !canSubmit,
+    onClick: () => onCreate(name.trim(), date, pairs.map(p => p.trim()))
+  }, "Crear torneo")));
+}
+function OrdenEmparejamientos({
+  tournament,
+  onBack,
+  onConfirm
+}) {
+  const [order, setOrder] = useState(tournament.order);
+  const [mode, setMode] = useState(null);
+  const [shuffling, setShuffling] = useState(false);
+  const byId = Object.fromEntries(tournament.pairs.map(p => [p.id, p]));
+  const runSorteo = () => {
+    setMode("sorteo");
+    setShuffling(true);
+    let ticks = 0;
+    const timer = setInterval(() => {
+      setOrder(prev => {
+        const arr = [...prev];
+        for (let i = arr.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+        return arr;
+      });
+      ticks += 1;
+      if (ticks > 8) {
+        clearInterval(timer);
+        setShuffling(false);
+      }
+    }, 90);
+  };
+  const move = (i, dir) => {
+    setOrder(prev => {
+      const arr = [...prev];
+      const j = i + dir;
+      if (j < 0 || j >= arr.length) return arr;
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+      return arr;
+    });
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "screen"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "screen-head"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "link-btn",
+    onClick: onBack
+  }, "← Torneos")), /*#__PURE__*/React.createElement("h1", null, "Emparejamientos de la liga"), /*#__PURE__*/React.createElement("p", {
+    className: "muted"
+  }, "Elige cómo fijar el orden de las 6 parejas antes de generar el calendario de liga (todas contra todas)."), /*#__PURE__*/React.createElement("div", {
+    className: "mode-choice"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-toggle" + (mode === "sorteo" ? " active" : ""),
+    onClick: runSorteo
+  }, "🎲 Sorteo aleatorio"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-toggle" + (mode === "manual" ? " active" : ""),
+    onClick: () => setMode("manual")
+  }, "✋ Introducir manualmente")), mode && /*#__PURE__*/React.createElement("div", {
+    className: "order-list"
+  }, order.map((id, i) => /*#__PURE__*/React.createElement("div", {
+    className: "order-row" + (shuffling ? " shuffling" : ""),
+    key: id
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "order-num"
+  }, i + 1), /*#__PURE__*/React.createElement("span", {
+    className: "order-name"
+  }, byId[id]?.name), mode === "manual" && /*#__PURE__*/React.createElement("span", {
+    className: "order-controls"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "icon-btn",
+    disabled: i === 0,
+    onClick: () => move(i, -1)
+  }, "↑"), /*#__PURE__*/React.createElement("button", {
+    className: "icon-btn",
+    disabled: i === order.length - 1,
+    onClick: () => move(i, 1)
+  }, "↓"))))), mode && /*#__PURE__*/React.createElement("div", {
+    className: "actions"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-primary",
+    disabled: shuffling,
+    onClick: () => onConfirm(order)
+  }, "Generar calendario de liga")));
+}
+function Liga({
+  tournament,
+  onBack,
+  onUpdateMatch,
+  onStartBracket
+}) {
+  const byId = useMemo(() => Object.fromEntries(tournament.pairs.map(p => [p.id, p])), [tournament.pairs]);
+  const standings = useMemo(() => computeStandings(tournament.pairs, tournament.rounds), [tournament]);
+  const complete = allMatchesPlayed(tournament.rounds);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "screen"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "screen-head"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "link-btn",
+    onClick: onBack
+  }, "← Torneos")), /*#__PURE__*/React.createElement("h1", null, "Fase de liga"), /*#__PURE__*/React.createElement("h2", {
+    className: "subhead"
+  }, "Clasificación"), /*#__PURE__*/React.createElement("table", {
+    className: "standings"
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null), /*#__PURE__*/React.createElement("th", null, "Pareja"), /*#__PURE__*/React.createElement("th", null, "PJ"), /*#__PURE__*/React.createElement("th", null, "PG"), /*#__PURE__*/React.createElement("th", null, "PP"), /*#__PURE__*/React.createElement("th", null, "Pts"))), /*#__PURE__*/React.createElement("tbody", null, standings.map((s, i) => /*#__PURE__*/React.createElement("tr", {
+    key: s.id,
+    className: i < 4 && complete ? "qualified" : ""
+  }, /*#__PURE__*/React.createElement("td", {
+    className: "pos"
+  }, i + 1), /*#__PURE__*/React.createElement("td", null, s.name), /*#__PURE__*/React.createElement("td", null, s.pj), /*#__PURE__*/React.createElement("td", null, s.pg), /*#__PURE__*/React.createElement("td", null, s.pp), /*#__PURE__*/React.createElement("td", {
+    className: "pts"
+  }, s.pts))))), /*#__PURE__*/React.createElement("h2", {
+    className: "subhead"
+  }, "Jornadas"), /*#__PURE__*/React.createElement("div", {
+    className: "rounds"
+  }, tournament.rounds.map((r, ri) => /*#__PURE__*/React.createElement("div", {
+    className: "round",
+    key: r.round
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "round-label"
+  }, "Jornada ", r.round), r.matches.map(m => /*#__PURE__*/React.createElement(MatchRow, {
+    key: m.id,
+    nameA: byId[m.pairA]?.name,
+    nameB: byId[m.pairB]?.name,
+    match: m,
+    onSave: (winner, scoreText) => onUpdateMatch(ri, m.id, winner, scoreText)
+  }))))), /*#__PURE__*/React.createElement("div", {
+    className: "actions"
+  }, complete ? /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-primary",
+    onClick: onStartBracket
+  }, "Pasar al cuadro final (Top 4) →") : /*#__PURE__*/React.createElement("p", {
+    className: "muted"
+  }, "Completa todos los partidos de la liga para desbloquear el cuadro final.")));
+}
+function MatchRow({
+  nameA,
+  nameB,
+  match,
+  onSave
+}) {
+  const [scoreText, setScoreText] = useState(match.scoreText);
+  const pick = winner => onSave(winner === match.winner ? null : winner, scoreText);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "match-row"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "pair-pick" + (match.winner === match.pairA ? " winner" : ""),
+    onClick: () => pick(match.pairA)
+  }, nameA), /*#__PURE__*/React.createElement("span", {
+    className: "vs"
+  }, "vs"), /*#__PURE__*/React.createElement("button", {
+    className: "pair-pick" + (match.winner === match.pairB ? " winner" : ""),
+    onClick: () => pick(match.pairB)
+  }, nameB), /*#__PURE__*/React.createElement("input", {
+    className: "score-input",
+    placeholder: "resultado (ej. 6-3, 6-4)",
+    value: scoreText,
+    onChange: e => setScoreText(e.target.value),
+    onBlur: () => onSave(match.winner, scoreText)
+  }));
+}
+function Cuadro({
+  tournament,
+  onBack,
+  onUpdateBracket,
+  onBackToLiga
+}) {
+  const byId = Object.fromEntries(tournament.pairs.map(p => [p.id, p]));
+  const {
+    semi1,
+    semi2,
+    final
+  } = tournament.bracket;
+  const champion = final.winner ? byId[final.winner]?.name : null;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "screen"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "screen-head"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "link-btn",
+    onClick: onBack
+  }, "← Torneos"), /*#__PURE__*/React.createElement("button", {
+    className: "link-btn",
+    onClick: onBackToLiga
+  }, "Ver liga")), /*#__PURE__*/React.createElement("h1", null, "Cuadro final"), /*#__PURE__*/React.createElement("div", {
+    className: "bracket"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bracket-col"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bracket-title"
+  }, "Semifinales"), /*#__PURE__*/React.createElement(BracketMatch, {
+    label: "Semifinal 1",
+    nameA: byId[semi1.pairA]?.name,
+    nameB: byId[semi1.pairB]?.name,
+    match: semi1,
+    onSave: (w, s) => onUpdateBracket("semi1", w, s)
+  }), /*#__PURE__*/React.createElement(BracketMatch, {
+    label: "Semifinal 2",
+    nameA: byId[semi2.pairA]?.name,
+    nameB: byId[semi2.pairB]?.name,
+    match: semi2,
+    onSave: (w, s) => onUpdateBracket("semi2", w, s)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "bracket-col"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bracket-title"
+  }, "Final"), final.pairA && final.pairB ? /*#__PURE__*/React.createElement(BracketMatch, {
+    label: "Final",
+    nameA: byId[final.pairA]?.name,
+    nameB: byId[final.pairB]?.name,
+    match: final,
+    onSave: (w, s) => onUpdateBracket("final", w, s)
+  }) : /*#__PURE__*/React.createElement("div", {
+    className: "bracket-pending"
+  }, "Esperando semifinalistas…"))), champion && /*#__PURE__*/React.createElement("div", {
+    className: "champion"
+  }, "🏆 Campeones: ", /*#__PURE__*/React.createElement("strong", null, champion)));
+}
+function BracketMatch({
+  label,
+  nameA,
+  nameB,
+  match,
+  onSave
+}) {
+  const [scoreText, setScoreText] = useState(match.scoreText);
+  const pick = winner => onSave(winner === match.winner ? null : winner, scoreText);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "bracket-match"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bracket-match-label"
+  }, label), /*#__PURE__*/React.createElement("button", {
+    className: "pair-pick" + (match.winner === match.pairA ? " winner" : ""),
+    onClick: () => pick(match.pairA)
+  }, nameA), /*#__PURE__*/React.createElement("button", {
+    className: "pair-pick" + (match.winner === match.pairB ? " winner" : ""),
+    onClick: () => pick(match.pairB)
+  }, nameB), /*#__PURE__*/React.createElement("input", {
+    className: "score-input",
+    placeholder: "resultado",
+    value: scoreText,
+    onChange: e => setScoreText(e.target.value),
+    onBlur: () => onSave(match.winner, scoreText)
+  }));
+}
+
+/* ---------- estilos ---------- */
+
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600&display=swap');
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+
+.app {
+  --bg: #EAF0EC;
+  --panel: #F6F9F5;
+  --ink: #16241F;
+  --muted: #5B6E63;
+  --court: #1F5C56;
+  --court-dark: #123C3A;
+  --line: #C9D6C9;
+  --accent: #93B23A;
+  --accent-dark: #71891F;
+  font-family: 'Inter', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  min-height: 100vh;
+  padding-bottom: 40px;
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 18px 20px;
+  border-bottom: 2px solid var(--court-dark);
+  background: var(--court);
+  color: #fff;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.brand {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-weight: 700;
+  font-size: 22px;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.brand-mark { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); display: inline-block; }
+.topbar-meta { text-align: right; font-size: 13px; opacity: 0.9; }
+.t-name { display: block; font-weight: 600; }
+.t-date { display: block; font-size: 12px; }
+
+.content { max-width: 760px; margin: 0 auto; padding: 24px 20px; }
+.loading { padding: 60px 0; text-align: center; color: var(--muted); }
+.diag { text-align: left; max-width: 480px; margin: 18px auto 0; background: #FFF7E6; border: 2px solid #E8CE8C; border-radius: 4px; padding: 14px 16px; color: #6B4E14; font-size: 13px; }
+.diag strong { color: #4A3406; }
+.diag code { display: block; background: #fff; border: 1px solid #E8CE8C; border-radius: 3px; padding: 6px 8px; margin: 6px 0; font-size: 11px; word-break: break-all; }
+.diag ul { margin: 6px 0 0; padding-left: 18px; }
+.diag li { margin-bottom: 4px; }
+
+h1 { font-family: 'Barlow Condensed', sans-serif; font-size: 34px; font-weight: 700; margin: 8px 0 18px; color: var(--court-dark); }
+.subhead {
+  font-family: 'Barlow Condensed', sans-serif; font-size: 22px; font-weight: 700;
+  margin: 28px 0 10px; padding-top: 14px; border-top: 2px solid var(--line); color: var(--court-dark);
+}
+.muted { color: var(--muted); font-size: 14px; }
+
+.screen-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.link-btn { background: none; border: none; color: var(--court); font-weight: 600; cursor: pointer; padding: 6px 0; font-size: 14px; }
+
+.btn { border: none; border-radius: 3px; padding: 11px 18px; font-weight: 600; font-size: 14px; cursor: pointer; font-family: 'Inter', sans-serif; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-primary { background: var(--court); color: #fff; }
+.btn-primary:hover:not(:disabled) { background: var(--court-dark); }
+.btn-toggle { background: var(--panel); border: 2px solid var(--line); color: var(--ink); }
+.btn-toggle.active { border-color: var(--accent-dark); background: #EFF5DF; }
+.screen-head .btn-primary { padding: 9px 16px; }
+
+.empty { padding: 40px 0; border-top: 2px solid var(--line); margin-top: 16px; }
+
+.t-list { list-style: none; margin: 18px 0 0; padding: 0; border-top: 2px solid var(--line); }
+.t-row { display: flex; align-items: center; gap: 14px; padding: 14px 4px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.t-row:hover { background: var(--panel); }
+.t-row-main { flex: 1; display: flex; flex-direction: column; }
+.t-row-name { font-weight: 600; }
+.t-row-date { font-size: 12px; color: var(--muted); }
+.badge { font-size: 11px; padding: 4px 9px; border-radius: 3px; font-weight: 600; white-space: nowrap; }
+.badge-orden { background: #E7E2CE; color: #6B5B1E; }
+.badge-liga { background: #DCEFC9; color: var(--accent-dark); }
+.badge-cuadro { background: #D6E7E4; color: var(--court-dark); }
+.icon-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 4px 6px; }
+.icon-btn:hover { color: var(--ink); }
+.icon-btn:disabled { opacity: 0.3; cursor: default; }
+
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 10px; }
+.pairs-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; font-weight: 600; color: var(--muted); }
+.field input { border: 2px solid var(--line); border-radius: 3px; padding: 9px 10px; font-size: 14px; font-family: inherit; color: var(--ink); background: #fff; width: 100%; }
+.field input:focus { outline: none; border-color: var(--court); }
+
+.actions { margin-top: 26px; }
+.mode-choice { display: flex; gap: 10px; margin: 14px 0 20px; }
+
+.order-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+.order-row { display: flex; align-items: center; gap: 12px; background: var(--panel); border: 2px solid var(--line); border-radius: 3px; padding: 9px 12px; transition: transform 0.08s ease; }
+.order-row.shuffling { transform: scale(0.99); }
+.order-num { font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 18px; color: var(--court); width: 22px; }
+.order-name { flex: 1; font-weight: 600; }
+.order-controls { display: flex; gap: 4px; }
+
+.standings { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 14px; }
+.standings th { text-align: left; font-family: 'Barlow Condensed', sans-serif; font-size: 13px; letter-spacing: 0.03em; color: var(--muted); border-bottom: 2px solid var(--court); padding: 6px 8px; }
+.standings td { padding: 8px; border-bottom: 1px solid var(--line); }
+.standings .pos { color: var(--muted); font-weight: 600; }
+.standings .pts { font-weight: 700; color: var(--court-dark); }
+.standings tr.qualified { background: #EFF5DF; }
+
+.rounds { display: flex; flex-direction: column; gap: 18px; margin-top: 8px; }
+.round-label { font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 15px; color: var(--court); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+.match-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.pair-pick { flex: 1; min-width: 120px; text-align: left; background: #fff; border: 2px solid var(--line); border-radius: 3px; padding: 8px 10px; font-size: 13.5px; font-weight: 600; color: var(--ink); cursor: pointer; }
+.pair-pick.winner { border-color: var(--accent-dark); background: #EFF5DF; color: var(--accent-dark); }
+.vs { font-size: 11px; color: var(--muted); font-weight: 700; }
+.score-input { flex-basis: 100%; border: none; border-bottom: 1px solid var(--line); background: transparent; font-size: 12.5px; padding: 4px 2px; color: var(--muted); }
+.score-input:focus { outline: none; border-color: var(--court); }
+
+.bracket { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 10px; }
+.bracket-title { font-family: 'Barlow Condensed', sans-serif; text-transform: uppercase; letter-spacing: 0.04em; color: var(--court); font-weight: 700; font-size: 14px; margin-bottom: 10px; }
+.bracket-match { background: var(--panel); border: 2px solid var(--line); border-radius: 3px; padding: 12px; display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+.bracket-match-label { font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+.bracket-pending { color: var(--muted); font-size: 13px; padding: 12px; }
+.champion { margin-top: 20px; padding: 16px; text-align: center; background: var(--court); color: #fff; border-radius: 3px; font-size: 18px; font-family: 'Barlow Condensed', sans-serif; }
+
+@media (max-width: 560px) {
+  .form-grid, .pairs-grid { grid-template-columns: 1fr; }
+  .bracket { grid-template-columns: 1fr; }
+  h1 { font-size: 28px; }
+}
+`;
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(/*#__PURE__*/React.createElement(App, null));</script>
+</body>
+</html>
