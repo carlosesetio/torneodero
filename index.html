@@ -15,96 +15,25 @@
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
 <body>
-<div id="root"></div>
+<div id="error-banner" style="display:none; background:#fee; color:#900; padding:12px; font-family:monospace; font-size:12px; white-space:pre-wrap; border-bottom:2px solid #900;"></div>
+<div id="root">Cargando…</div>
 
-<script type="text/babel" data-presets="react">
-const { useState, useEffect, useMemo, useCallback } = React;
-
-/* =========================================================
-   1) CONFIGURACIÓN DE FIREBASE
-   Sustituye estos valores por los de TU proyecto de Firebase:
-   Firebase console -> Configuración del proyecto -> Tus apps -> Web (</>)
-   ========================================================= */
-const firebaseConfig = {
-  apiKey: "AIzaSyAs_VWKB5Q16uTUJeZGnkJY-VXnPQtsTd4",
-  authDomain: "torneosdero.firebaseapp.com",
-  databaseURL: "https://torneosdero-default-rtdb.europe-west1.firebasedatabase.app",
-  projectId: "torneosdero",
-  storageBucket: "torneosdero.firebasestorage.app",
-  messagingSenderId: "614062530013",
-  appId: "1:614062530013:web:59f5c0e874a16f8bf92a34",
-};
-
-firebase.initializeApp(firebaseConfig);
-const db = firebase.database();
-
-/* ---------- utilidades ---------- */
-
-const uid = () => Math.random().toString(36).slice(2, 10);
-
-function generateRoundRobin(pairIds) {
-  // método del círculo: 6 parejas -> 5 jornadas x 3 partidos
-  const n = pairIds.length;
-  const fixed = pairIds[0];
-  let rotating = pairIds.slice(1);
-  const rounds = [];
-  for (let r = 0; r < n - 1; r++) {
-    const current = [fixed, ...rotating];
-    const matches = [];
-    for (let i = 0; i < n / 2; i++) {
-      matches.push({
-        id: uid(),
-        pairA: current[i],
-        pairB: current[n - 1 - i],
-        scoreText: "",
-        winner: null,
-      });
-    }
-    rounds.push({ round: r + 1, matches });
-    rotating.unshift(rotating.pop());
+<script>
+  function mostrarError(msg) {
+    var b = document.getElementById("error-banner");
+    b.style.display = "block";
+    b.textContent += msg + "\n";
   }
-  return rounds;
-}
-
-function computeStandings(pairs, rounds) {
-  const table = {};
-  pairs.forEach((p) => {
-    table[p.id] = { id: p.id, name: p.name, pj: 0, pg: 0, pp: 0, pts: 0 };
+  window.addEventListener("error", function (e) {
+    mostrarError("Error: " + e.message + " (" + (e.filename || "") + ":" + (e.lineno || "") + ")");
   });
-  rounds.forEach((r) =>
-    r.matches.forEach((m) => {
-      if (!m.winner) return;
-      const loser = m.winner === m.pairA ? m.pairB : m.pairA;
-      if (table[m.winner]) {
-        table[m.winner].pj += 1;
-        table[m.winner].pg += 1;
-        table[m.winner].pts += 2;
-      }
-      if (table[loser]) {
-        table[loser].pj += 1;
-        table[loser].pp += 1;
-      }
-    })
-  );
-  return Object.values(table).sort((a, b) => b.pts - a.pts || b.pg - a.pg || a.name.localeCompare(b.name));
-}
+  window.addEventListener("unhandledrejection", function (e) {
+    var reason = e.reason && e.reason.message ? e.reason.message : e.reason;
+    mostrarError("Promesa rechazada: " + reason);
+  });
+</script>
 
-function allMatchesPlayed(rounds) {
-  return rounds.every((r) => r.matches.every((m) => m.winner));
-}
-
-/* ---------- capa de datos (Firebase Realtime Database) ---------- */
-/* Todo el grupo lee y escribe el mismo nodo "torneos", por eso los
-   cambios se ven en tiempo real en todos los dispositivos. */
-
-function useTournamentsIndex() {
-  const [index, setIndex] = useState([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    const ref = db.ref("torneos");
-    const handler = ref.on(
-      "value",
+<script type="text/babel" data-presets="react">      "value",
       (snap) => {
         const val = snap.val() || {};
         const list = Object.values(val)
